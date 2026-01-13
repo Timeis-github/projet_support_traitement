@@ -1,0 +1,134 @@
+1️⃣ Informations générales sur le job et le fichier
+
+Ces champs identifient qui, quoi, et où.
+
+uid
+→ Identifiant de l’utilisateur qui a lancé le job.
+
+jobid
+→ Identifiant unique du job sur le supercalculateur.
+
+rank
+→ Rang MPI du processus qui a accédé au fichier (ex. rank 0, 1, 2, …).
+
+recordid
+→ Identifiant unique du fichier dans Darshan (un job peut avoir plusieurs recordid).
+
+fstype
+→ Type de système de fichiers (ex. Lustre, NFS, etc.).
+
+👉 Dans ton projet :
+
+uid et jobid sont essentiels
+
+rank et recordid servent surtout à comprendre que plusieurs lignes peuvent correspondre au même job
+
+
+
+2️⃣ Compteurs POSIX – opérations sur les fichiers
+
+Ces champs décrivent comment un job accède aux fichiers via l’API POSIX.
+
+📂 Ouverture / gestion des fichiers
+
+POSIX_OPENS → nombre d’ouvertures de fichiers
+
+POSIX_FILENOS → nombre de fichiers distincts utilisés
+
+POSIX_DUPS → duplications de descripteurs de fichiers
+
+📖📤 Lecture / écriture
+
+POSIX_READS → nombre d’opérations de lecture
+
+POSIX_WRITES → nombre d’opérations d’écriture
+
+POSIX_SEEKS → déplacements dans le fichier (seek)
+
+📊 Métadonnées
+
+POSIX_STATS → appels stat (infos sur les fichiers)
+
+POSIX_MMAPS → accès mémoire mappée
+
+POSIX_FSYNCS, POSIX_FDSYNCS → synchronisations sur disque
+
+👉 Pour ton travail :
+
+POSIX_FILENOS → utile pour le nombre total de fichiers
+
+POSIX_READS / WRITES → utiles pour compter les phases I/O
+
+
+
+
+3️⃣ POSIX – Volume de données transférées
+
+Ces champs indiquent combien de données sont réellement lues/écrites.
+
+POSIX_BYTES_READ → nombre total d’octets lus
+
+POSIX_BYTES_WRITTEN → nombre total d’octets écrits
+
+👉 Pour ton projet :
+
+total amount of data = POSIX_BYTES_READ + POSIX_BYTES_WRITTEN
+
+À sommer par job
+
+
+
+4️⃣ POSIX – Patterns d’accès (séquentiel / consécutif)
+
+Ils décrivent la manière dont les données sont accédées.
+
+POSIX_CONSEC_READS / WRITES → accès consécutifs
+
+POSIX_SEQ_READS / WRITES → accès séquentiels
+
+👉 Utile pour l’analyse des performances, pas indispensable pour ton rendu final.
+
+
+
+
+5️⃣ POSIX – Tailles des accès (histogrammes)
+
+Ces champs indiquent la taille des lectures/écritures, regroupées par tranches.
+
+Exemples :
+
+POSIX_SIZE_READ_0_100 → lectures entre 0 et 100 octets
+
+POSIX_SIZE_READ_1M_4M → lectures entre 1 et 4 Mo
+
+POSIX_SIZE_WRITE_1G_PLUS → écritures > 1 Go
+
+👉 Ce sont des comptages, pas des tailles cumulées.
+👉 Intéressant pour l’analyse I/O, non requis directement pour ton output.
+
+
+
+
+6️⃣ POSIX – Temps et timestamps I/O
+⏱️ Timestamps
+
+POSIX_F_OPEN_START_TIMESTAMP / END
+
+POSIX_F_READ_START_TIMESTAMP / END
+
+POSIX_F_WRITE_START_TIMESTAMP / END
+
+POSIX_F_CLOSE_START_TIMESTAMP / END
+
+→ Moments où les opérations commencent et finissent.
+
+⏳ Temps cumulés
+
+POSIX_F_READ_TIME → temps total passé à lire
+
+POSIX_F_WRITE_TIME → temps total passé à écrire
+
+POSIX_F_META_TIME → temps passé sur les métadonnées
+
+
+total time spent on I/O = READ_TIME + WRITE_TIME + META_TIME
