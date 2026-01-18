@@ -4,9 +4,17 @@ from pyspark import SparkContext, SparkConf
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from timeit import default_timer as timer
+from pyspark.sql.window import Window
 from math import ceil
+import os
 
-conf = SparkConf().setAppName("projet")
+os.environ["SPARK_LOCAL_DIRS"] = "/home/llahlah/spark_tmp"
+os.environ["TMPDIR"] = "/home/llahlah/spark_tmp"
+
+conf = SparkConf() \
+    .setAppName("projet") \
+    .set("spark.local.dir", "/home/llahlah/spark_tmp")
+
 sc = SparkContext(conf=conf)
 sc.setLogLevel("ERROR")
 spark = SparkSession(sc)
@@ -63,15 +71,159 @@ largest_users_jobids_df = largest_users_jobs_df.select("jobid")
 jobids_df = longest_jobids_df.union(largest_jobs_IO_jobids_df).union(largest_users_jobids_df).distinct()
 
 
-final_df = jobids_df
+job_base_df = jobids_df \
+    .join(job_execution_times_df, on="jobid", how="left") \
+    .join(job_data_df, on="jobid", how="left")
+    
+uid_df = lines_df.select("jobid", "uid").distinct()
+job_base_df = job_base_df.join(uid_df, on="jobid", how="left")
+
+job_base_df = job_base_df.withColumn(
+    "total_data_amount",
+    F.coalesce(F.col("total_data_amount"), F.lit(0))
+)
+
+lustre_io_df = lines_df.filter(
+    (F.col("fstype") == "lustre") &
+    ((F.col("POSIX_BYTES_READ") + F.col("POSIX_BYTES_WRITTEN")) > 0)
+).select(
+    "jobid", "uid",
+    "POSIX_F_READ_START_TIMESTAMP", "POSIX_F_READ_END_TIMESTAMP",
+    "POSIX_F_WRITE_START_TIMESTAMP", "POSIX_F_WRITE_END_TIMESTAMP",
+    "POSIX_F_READ_TIME", "POSIX_F_WRITE_TIME"
+)
+
+# start / end / io_time par accès fichier
+lustre_io_df = lustre_io_df.withColumn(
+    "start_ts",
+    F.least(
+        F.when(F.col("POSIX_F_READ_START_TIMESTAMP") > 0, F.col("POSIX_F_READ_START_TIMESTAMP")),
+        F.when(F.col("POSIX_F_WRITE_START_TIMESTAMP") > 0, F.col("POSIX_F_WRITE_START_TIMESTAMP"))
+    )
+).withColumn(
+    "end_ts",
+    F.greatest(
+        F.when(F.col("POSIX_F_READ_END_TIMESTAMP") > 0, F.col("POSIX_F_READ_END_TIMESTAMP")),
+        F.when(F.col("POSIX_F_WRITE_END_TIMESTAMP") > 0, F.col("POSIX_F_WRITE_END_TIMESTAMP"))
+    )
+).withColumn(
+    "io_time",
+    F.greatest(
+        F.coalesce(F.col("POSIX_F_READ_TIME"), F.lit(0)),
+        F.coalesce(F.col("POSIX_F_WRITE_TIME"), F.lit(0))
+    )
+)
+
+# Fusion des phases I/O par job
+w = Window.partitionBy("jobid").orderBy("start_ts")
+
+lustre_io_df = lustre_io_df.withColumn("prev_end", F.lag("end_ts").over(w))
+
+lustre_io_df = lustre_io_df.withColumn(
+    "new_phase",
+    F.when(
+        (F.col("prev_end").isNull()) |
+        (F.col("start_ts") > F.col("prev_end")),
+        1
+    ).otherwise(0)
+)
+
+lustre_io_df = lustre_io_df.withColumn(
+    "phase_id",
+    F.sum("new_phase").over(w)
+)
+
+io_phases_df = lustre_io_df.groupBy("jobid", "phase_id").agg(
+    F.max("io_time").alias("phase_io_time")
+)
+
+job_io_df = io_phases_df.groupBy("jobid").agg(
+    F.sum("phase_io_time").alias("job_io_time")
+)
+
+job_io_df = job_io_df.join(
+    job_execution_times_df.select("jobid", "execution_time"),
+    on="jobid",
+    how="left"
+)
+
+job_io_df = job_io_df.withColumn(
+    "job_io_time",
+    F.when(
+        (F.col("job_io_time") == 0) |
+        (F.col("execution_time").isNull()) |
+        (F.col("job_io_time") > F.col("execution_time")),
+        -1
+    ).otherwise(F.col("job_io_time"))
+)
+
+# Nettoyage : SEULEMENT ce qui sera joint
+job_io_df = job_io_df.select("jobid", "job_io_time")
+
+final_df = job_base_df.join(job_io_df, on="jobid", how="left")
+
+
+final_df = final_df.withColumn(
+    "job_io_time",
+    F.when(F.col("job_io_time").isNull(), 0)
+     .otherwise(F.col("job_io_time"))
+)
+
+
+
+# Calcul du nombre de fichier (accessed via POSIX interface from the Lustre file system)
+
+
+# Nombre total de fichiers POSIX Lustre par job
+job_files_df = file_data_df.select(
+    "jobid",
+    "recordid"   # identifiant unique du fichier
+).distinct().groupBy("jobid").agg(
+    F.count("recordid").alias("total_files")
+)
+
+final_df = final_df.join(job_files_df, on="jobid", how="left")
+
+final_df = final_df.withColumn(
+    "total_files",
+    F.coalesce(F.col("total_files"), F.lit(0))
+)
+
+
+
+# Nombre total de phase I/O
+
+job_phases_df = io_phases_df.groupBy("jobid").agg(
+    F.count("phase_id").alias("total_io_phases")
+)
+
+final_df = final_df.join(job_phases_df, on="jobid", how="left")
+
+# Remplacer les nulls par 0 si un job n'a aucune phase I/O
+final_df = final_df.withColumn(
+    "total_io_phases",
+    F.coalesce(F.col("total_io_phases"), F.lit(0))
+)
+
+
+
+
 
 
 # Compare with existing results
 df_result = spark.read.option("header", "false").option("inferSchema", "true").csv("/user/fzanonboito/CISD/topjobs/topjobs_9/*")
 df_result.show()
 
-jobids_df.distinct().show()
-jobids_df.distinct().show()
+final_df.select(
+    "jobid",
+    "uid",
+    "execution_time",
+    "total_data_amount",
+    "job_io_time",
+    "total_files",
+    "total_io_phases"
+).distinct().show()
+
 
 
 end = timer()
