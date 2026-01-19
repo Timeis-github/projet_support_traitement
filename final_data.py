@@ -7,6 +7,9 @@ from timeit import default_timer as timer
 from pyspark.sql.window import Window
 from math import ceil
 import os
+import sys
+
+
 
 os.environ["SPARK_LOCAL_DIRS"] = "/home/llahlah/spark_tmp"
 os.environ["TMPDIR"] = "/home/llahlah/spark_tmp"
@@ -21,7 +24,20 @@ spark = SparkSession(sc)
 
 start = timer()
 
-lines_df = spark.read.load("/user/fzanonboito/CISD/darshan/9/Darshan.csv", format = "csv", header = "true", inferSchema = "true")
+if len(sys.argv) == 1:
+    lines_df = spark.read.load("/user/fzanonboito/CISD/darshan/9/Darshan.csv", format = "csv", header = "true", inferSchema = "true")
+elif len(sys.argv) < 3:
+    print("Usage: spark-submit script.py <csv1> <csv2> ... <output_dir>")
+    sys.exit(1)
+else :
+    input_paths = sys.argv[1:-1] 
+    output_path = sys.argv[-1]    
+    dfs = [spark.read.option("header", True).option("inferSchema", True).csv(p) for p in input_paths]
+    lines_df = dfs[0]
+    for df in dfs[1:]:
+        lines_df = lines_df.unionByName(df)
+
+
 for i in range(5, len(lines_df.columns)):
     lines_df = lines_df.withColumn(lines_df.columns[i], lines_df[lines_df.columns[i]].cast("double"))
 lines_df = lines_df.cache()
@@ -220,15 +236,7 @@ final_df = final_df.withColumn(
 )
 
 
-
-
-
-
-# Compare with existing results
-df_result = spark.read.option("header", "false").option("inferSchema", "true").csv("/user/fzanonboito/CISD/topjobs/topjobs_9/*")
-df_result.sort("_c0").show()
-
-final_df.select(
+final_df = final_df.select(
     "jobid",
     "uid",
     "execution_time",
@@ -236,9 +244,44 @@ final_df.select(
     "job_io_time",
     "total_files",
     "total_io_phases"
-).distinct().sort("jobid").show()
+).distinct().sort("jobid")
 
 
+
+# Compare with existing results
+df_result = spark.read.option("header", "false").option("inferSchema", "true").csv("/user/fzanonboito/CISD/topjobs/topjobs_9/*")
+print("df_result has " + str(df_result.count()))
+df_result.sort("_c0").show()
+
+
+print("final_df has " + str(final_df.count()))
+final_df.sort("jobid").show()
+
+
+
+df_result = df_result.withColumnRenamed("_c0", "jobid_result")
+
+common_jobids = final_df.join(
+    df_result,
+    final_df.jobid == df_result.jobid_result,
+    "inner"
+).select(final_df.jobid).distinct()
+
+print("common_jobids has " + str(common_jobids.count()))
+common_jobids.show()
+
+
+missing_in_jobids = df_result.join(
+    final_df,
+    df_result.jobid_result == final_df.jobid,
+    "left_anti"
+)
+
+print("missing_in_jobids has " + str(missing_in_jobids.count()))
+missing_in_jobids.show()
+
+if len(sys.argv) != 1:
+    jobids_df.write.mode("overwrite").csv(output_path)
 
 end = timer()
 print("Time : " + str(end - start))
