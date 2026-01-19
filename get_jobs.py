@@ -23,8 +23,15 @@ from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from timeit import default_timer as timer
 from math import ceil
+import os
 
-conf = SparkConf().setAppName("projet")
+os.environ["SPARK_LOCAL_DIRS"] = "/home/llahlah/spark_tmp"
+os.environ["TMPDIR"] = "/home/llahlah/spark_tmp"
+
+conf = SparkConf() \
+    .setAppName("projet") \
+    .set("spark.local.dir", "/home/llahlah/spark_tmp")
+
 sc = SparkContext(conf=conf)
 sc.setLogLevel("ERROR")
 spark = SparkSession(sc)
@@ -79,6 +86,37 @@ longest_jobids_df = longest_jobs_df.select("jobid")
 largest_jobs_IO_jobids_df = largest_jobs_IO_df.select("jobid")
 largest_users_jobids_df = largest_users_jobs_df.select("jobid")
 jobids_df = longest_jobids_df.union(largest_jobs_IO_jobids_df).union(largest_users_jobids_df).distinct()
+
+# Compare with existing results
+
+
+df_result = spark.read.option("header", "false").option("inferSchema", "true").csv("/user/fzanonboito/CISD/topjobs/topjobs_9/*")
+print("df_result has " + str(df_result.count()))
+df_result.sort("_c0").show()
+
+
+print("jobids_df has " + str(jobids_df.count()))
+jobids_df.sort("jobid").show()
+
+
+
+
+common_jobids = jobids_df.join(df_result,jobids_df.jobid == df_result._c0,"inner").select(jobids_df.jobid).distinct()
+print("common_jobids has " + str(common_jobids.count()))
+common_jobids.show()
+
+
+missing_in_jobids = df_result.join(
+    jobids_df,
+    df_result._c0 == jobids_df.jobid,
+    "left_anti"
+)
+
+print("missing_in_jobids has " + str(missing_in_jobids.count()))
+missing_in_jobids.show()
+
+
+
 
 
 

@@ -29,8 +29,18 @@ lines_df = lines_df.cache()
 # Largest execution time jobs
 # execution time is the difference between the minimum of all _TIMESTAMP fields and the maximum of all _TIMESTAMP fields of all rows with the same jobid
 timestamp_columns = [col for col in lines_df.columns if col.endswith("_TIMESTAMP")]
-min_timestamp = F.least(*[F.col(col) for col in timestamp_columns])
-max_timestamp = F.greatest(*[F.col(col) for col in timestamp_columns])
+valid_starts = [
+    F.coalesce(F.col(c), F.lit(float("inf")))
+    for c in timestamp_columns
+]
+valid_ends = [
+    F.coalesce(F.col(c), F.lit(0))
+    for c in timestamp_columns
+]
+
+min_timestamp = F.least(*valid_starts)
+max_timestamp = F.greatest(*valid_ends)
+
 job_times_df = lines_df.withColumn("min_timestamp", min_timestamp).withColumn("max_timestamp", max_timestamp)
 job_times_df = job_times_df.withColumn("execution_time", F.col("max_timestamp") - F.col("min_timestamp"))
 job_execution_times_df = job_times_df.groupBy("jobid").agg(F.min("min_timestamp").alias("job_start"), F.max("max_timestamp").alias("job_end"))
@@ -93,26 +103,26 @@ lustre_io_df = lines_df.filter(
     "POSIX_F_READ_TIME", "POSIX_F_WRITE_TIME"
 )
 
-# start / end / io_time par accès fichier
 lustre_io_df = lustre_io_df.withColumn(
     "start_ts",
     F.least(
-        F.when(F.col("POSIX_F_READ_START_TIMESTAMP") > 0, F.col("POSIX_F_READ_START_TIMESTAMP")),
-        F.when(F.col("POSIX_F_WRITE_START_TIMESTAMP") > 0, F.col("POSIX_F_WRITE_START_TIMESTAMP"))
+        F.coalesce(F.col("POSIX_F_READ_START_TIMESTAMP"), F.lit(float("inf"))),
+        F.coalesce(F.col("POSIX_F_WRITE_START_TIMESTAMP"), F.lit(float("inf")))
     )
 ).withColumn(
     "end_ts",
     F.greatest(
-        F.when(F.col("POSIX_F_READ_END_TIMESTAMP") > 0, F.col("POSIX_F_READ_END_TIMESTAMP")),
-        F.when(F.col("POSIX_F_WRITE_END_TIMESTAMP") > 0, F.col("POSIX_F_WRITE_END_TIMESTAMP"))
+        F.coalesce(F.col("POSIX_F_READ_END_TIMESTAMP"), F.lit(0)),
+        F.coalesce(F.col("POSIX_F_WRITE_END_TIMESTAMP"), F.lit(0))
     )
 ).withColumn(
     "io_time",
-    F.greatest(
-        F.coalesce(F.col("POSIX_F_READ_TIME"), F.lit(0)),
-        F.coalesce(F.col("POSIX_F_WRITE_TIME"), F.lit(0))
-    )
+    F.coalesce(F.col("POSIX_F_READ_TIME"), F.lit(0)) +
+    F.coalesce(F.col("POSIX_F_WRITE_TIME"), F.lit(0))
 )
+
+
+
 
 # Fusion des phases I/O par job
 w = Window.partitionBy("jobid").orderBy("start_ts")
@@ -165,21 +175,23 @@ final_df = job_base_df.join(job_io_df, on="jobid", how="left")
 
 final_df = final_df.withColumn(
     "job_io_time",
-    F.when(F.col("job_io_time").isNull(), 0)
-     .otherwise(F.col("job_io_time"))
+    F.when(
+        (F.col("job_io_time").isNull()) |
+        (F.col("job_io_time") == 0) |
+        (F.col("job_io_time") > F.col("execution_time")),
+        -1
+    ).otherwise(F.col("job_io_time"))
 )
-
 
 
 # Calcul du nombre de fichier (accessed via POSIX interface from the Lustre file system)
 
 
 # Nombre total de fichiers POSIX Lustre par job
-job_files_df = file_data_df.select(
-    "jobid",
-    "recordid"   # identifiant unique du fichier
-).distinct().groupBy("jobid").agg(
-    F.count("recordid").alias("total_files")
+job_files_df = lustre_df.filter(
+    (F.col("POSIX_BYTES_READ") + F.col("POSIX_BYTES_WRITTEN")) > 0
+).groupBy("jobid").agg(
+    F.count("*").alias("total_files")
 )
 
 final_df = final_df.join(job_files_df, on="jobid", how="left")
@@ -193,8 +205,10 @@ final_df = final_df.withColumn(
 
 # Nombre total de phase I/O
 
-job_phases_df = io_phases_df.groupBy("jobid").agg(
-    F.count("phase_id").alias("total_io_phases")
+job_phases_df = io_phases_df.select(
+    "jobid", "phase_id"
+).distinct().groupBy("jobid").agg(
+    F.count("*").alias("total_io_phases")
 )
 
 final_df = final_df.join(job_phases_df, on="jobid", how="left")
@@ -212,7 +226,7 @@ final_df = final_df.withColumn(
 
 # Compare with existing results
 df_result = spark.read.option("header", "false").option("inferSchema", "true").csv("/user/fzanonboito/CISD/topjobs/topjobs_9/*")
-df_result.show()
+df_result.sort("_c0").show()
 
 final_df.select(
     "jobid",
@@ -222,7 +236,7 @@ final_df.select(
     "job_io_time",
     "total_files",
     "total_io_phases"
-).distinct().show()
+).distinct().sort("jobid").show()
 
 
 
