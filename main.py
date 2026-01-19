@@ -45,11 +45,9 @@ lines_df = lines_df.cache()
 # Largest execution time jobs
 # execution time is the difference between the minimum of all _TIMESTAMP fields and the maximum of all _TIMESTAMP fields of all rows with the same jobid
 timestamp_columns = [col for col in lines_df.columns if col.endswith("_TIMESTAMP")]
-
 # Set -1 values to null in timestamp columns
 for col in timestamp_columns:
     lines_df = lines_df.withColumn(col, F.when(F.col(col) == -1, None).otherwise(F.col(col)))
-
 valid_starts = [
     F.coalesce(F.col(c), F.lit(float("inf")))
     for c in timestamp_columns
@@ -64,8 +62,18 @@ max_timestamp = F.greatest(*valid_ends)
 
 job_times_df = lines_df.withColumn("min_timestamp", min_timestamp).withColumn("max_timestamp", max_timestamp)
 job_times_df = job_times_df.withColumn("execution_time", F.col("max_timestamp") - F.col("min_timestamp"))
-job_execution_times_df = job_times_df.groupBy("jobid").agg(F.min("min_timestamp").alias("job_start"), F.max("max_timestamp").alias("job_end"))
-job_execution_times_df = job_execution_times_df.withColumn("execution_time", F.col("job_end") - F.col("job_start"))
+job_execution_times_df = job_times_df.groupBy("jobid").agg(
+    F.min("min_timestamp").alias("job_start"), 
+    F.max("max_timestamp").alias("job_end")
+)
+
+# FIX: Check if job_start is infinite (meaning no valid timestamps were found).
+# If so, force execution_time to 0.0.
+job_execution_times_df = job_execution_times_df.withColumn(
+    "execution_time", 
+    F.when(F.col("job_start") == float("inf"), 0.0)
+    .otherwise(F.col("job_end") - F.col("job_start"))
+)
 total_jobs = job_execution_times_df.count()
 top_n = ceil(total_jobs * 0.1)
 longest_jobs_df = job_execution_times_df.orderBy(F.desc("execution_time")).limit(top_n)
@@ -80,8 +88,6 @@ file_data_df = file_data_df.cache()
 job_data_df = file_data_df.groupBy("jobid").agg(F.sum("data_amount").alias("total_data_amount"))
 job_data_df = job_data_df.cache() # Will be reused
 # get top 10% jobs by data amount
-total_jobs = job_data_df.count()
-
 largest_jobs_IO_df = job_data_df.orderBy(F.desc("total_data_amount")).limit(top_n)
 
 # Users with largest I/O
@@ -114,129 +120,117 @@ job_base_df = job_base_df.withColumn(
     F.coalesce(F.col("total_data_amount"), F.lit(0))
 )
 
-lustre_io_df = lines_df.filter(
+
+
+# ==============================================================================
+# CORRECTED LOGIC FOR I/O PHASES AND TIME
+# ==============================================================================
+
+# 1. Filter and Prepare Data
+# Keep only Lustre accesses with actual data transfer (>0 bytes)
+lustre_events_df = lines_df.filter(
     (F.col("fstype") == "lustre") &
     ((F.col("POSIX_BYTES_READ") + F.col("POSIX_BYTES_WRITTEN")) > 0)
-).select(
-    "jobid", "uid",
-    "POSIX_F_READ_START_TIMESTAMP", "POSIX_F_READ_END_TIMESTAMP",
-    "POSIX_F_WRITE_START_TIMESTAMP", "POSIX_F_WRITE_END_TIMESTAMP",
-    "POSIX_F_READ_TIME", "POSIX_F_WRITE_TIME"
 )
 
-lustre_io_df = lustre_io_df.withColumn(
+# Calculate Start/End timestamps and IO Time for each file access
+# We use F.least/greatest to handle cases where a file is only Read or only Written.
+# These functions skip nulls, effectively taking the available valid timestamp.
+lustre_events_df = lustre_events_df.withColumn(
     "start_ts",
-    F.least(*[F.col("POSIX_F_READ_START_TIMESTAMP"), F.col("POSIX_F_WRITE_START_TIMESTAMP")])
+    F.least("POSIX_F_READ_START_TIMESTAMP", "POSIX_F_WRITE_START_TIMESTAMP")
 ).withColumn(
     "end_ts",
-    F.greatest(*[F.col("POSIX_F_READ_END_TIMESTAMP"), F.col("POSIX_F_WRITE_END_TIMESTAMP")])
+    F.greatest("POSIX_F_READ_END_TIMESTAMP", "POSIX_F_WRITE_END_TIMESTAMP")
 ).withColumn(
     "io_time",
-    F.coalesce(F.col("POSIX_F_READ_TIME"), F.lit(0)) +
-    F.coalesce(F.col("POSIX_F_WRITE_TIME"), F.lit(0))
+    F.coalesce(F.col("POSIX_F_READ_TIME"), F.lit(0.0)) +
+    F.coalesce(F.col("POSIX_F_WRITE_TIME"), F.lit(0.0))
 )
 
+# Filter out rows with invalid or missing timestamps
+lustre_events_df = lustre_events_df.filter(
+    F.col("start_ts").isNotNull() & 
+    F.col("end_ts").isNotNull() & 
+    (F.col("start_ts") <= F.col("end_ts"))
+)
 
+# 2. Merge Overlapping Intervals (I/O Phases)
+# To merge intervals, we sort by start time and track the maximum end time seen so far.
+w_sort = Window.partitionBy("jobid").orderBy("start_ts", F.desc("end_ts"))
 
+# Calculate 'prev_max_end': the max end_ts of all previous rows in the sorted window.
+# We use rowsBetween(Window.unboundedPreceding, -1) to look at everything strictly before the current row.
+lustre_events_df = lustre_events_df.withColumn(
+    "prev_max_end",
+    F.max("end_ts").over(w_sort.rowsBetween(Window.unboundedPreceding, -1))
+)
 
-# Fusion des phases I/O par job
-w = Window.partitionBy("jobid").orderBy("start_ts")
-
-lustre_io_df = lustre_io_df.withColumn("prev_end", F.lag("end_ts").over(w))
-
-lustre_io_df = lustre_io_df.withColumn(
-    "new_phase",
+# A new phase starts if there is a gap: current start > max end of previous rows.
+# (Or if it's the very first row, i.e., prev_max_end is null)
+lustre_events_df = lustre_events_df.withColumn(
+    "is_new_phase",
     F.when(
-        (F.col("prev_end").isNull()) |
-        (F.col("start_ts") > F.col("prev_end")),
+        (F.col("prev_max_end").isNull()) | 
+        (F.col("start_ts") > F.col("prev_max_end")), 
         1
     ).otherwise(0)
 )
 
-lustre_io_df = lustre_io_df.withColumn(
+# Assign a unique phase_id per job by cumulatively summing 'is_new_phase'
+lustre_events_df = lustre_events_df.withColumn(
     "phase_id",
-    F.sum("new_phase").over(w)
+    F.sum("is_new_phase").over(w_sort.rowsBetween(Window.unboundedPreceding, Window.currentRow))
 )
 
-io_phases_df = lustre_io_df.groupBy("jobid", "phase_id").agg(
+# 3. Aggregation
+# Calculate IO Time per Phase: Max of file_io_time within that phase
+phase_metrics_df = lustre_events_df.groupBy("jobid", "phase_id").agg(
     F.max("io_time").alias("phase_io_time")
 )
 
-job_io_df = io_phases_df.groupBy("jobid").agg(
-    F.sum("phase_io_time").alias("job_io_time")
+# Calculate Job Total IO Time and Total Phases
+job_io_metrics_df = phase_metrics_df.groupBy("jobid").agg(
+    F.sum("phase_io_time").alias("job_io_time"),
+    F.count("phase_id").alias("total_io_phases")
 )
 
-job_io_df = job_io_df.join(
-    job_execution_times_df.select("jobid", "execution_time"),
-    on="jobid",
-    how="left"
-)
+# 4. Join and Clean Results (CORRECTED)
+# Join the I/O metrics back to the main job list
+# We use a Left Join because jobs without Lustre I/O won't exist in job_io_metrics_df
+final_df = job_base_df.join(job_io_metrics_df, on="jobid", how="left")
 
-job_io_df = job_io_df.withColumn(
-    "job_io_time",
-    F.when(
-        (F.col("job_io_time") == 0) |
-        (F.col("execution_time").isNull()) |
-        (F.col("job_io_time") > F.col("execution_time")),
-        -1
-    ).otherwise(F.col("job_io_time"))
-)
+# STEP A: Handle "No I/O" cases first
+# If a job is not found in job_io_metrics_df (NULL), it means it had 0 I/O.
+final_df = final_df.withColumn("job_io_time", F.coalesce(F.col("job_io_time"), F.lit(0.0)))
+final_df = final_df.withColumn("total_io_phases", F.coalesce(F.col("total_io_phases"), F.lit(0)))
 
-# Nettoyage : SEULEMENT ce qui sera joint
-job_io_df = job_io_df.select("jobid", "job_io_time")
-
-final_df = job_base_df.join(job_io_df, on="jobid", how="left")
-
-
+# STEP B: Apply Validation Logic
+# Set to -1 ONLY if:
+# 1. Execution time is missing (cannot validate)
+# 2. I/O Time is strictly greater than Execution Time (impossible data)
 final_df = final_df.withColumn(
     "job_io_time",
     F.when(
-        (F.col("job_io_time").isNull()) |
-        (F.col("job_io_time") == 0) |
+        (F.col("execution_time").isNull()) |
         (F.col("job_io_time") > F.col("execution_time")),
-        -1
+        -1.0
     ).otherwise(F.col("job_io_time"))
 )
 
-
-# Calcul du nombre de fichier (accessed via POSIX interface from the Lustre file system)
-
+# 5. Calculate Total Files
 job_files_df = lines_df.filter(
     (F.col("fstype") == "lustre") &
     ((F.col("POSIX_BYTES_READ") + F.col("POSIX_BYTES_WRITTEN")) > 0)
-).select(
-    "jobid",
-    "recordid"
-).distinct().groupBy("jobid").agg(
+).select("jobid", "recordid").distinct().groupBy("jobid").agg(
     F.count("recordid").alias("total_files")
 )
 
-
-
-
-# S'assurer que les jobs sans fichiers Lustre ont 0
+# 6. Final Assembly with File Counts
 final_df = final_df.join(job_files_df, on="jobid", how="left")
 final_df = final_df.withColumn("total_files", F.coalesce(F.col("total_files"), F.lit(0)))
 
-
-
-# Nombre total de phase I/O
-
-job_phases_df = io_phases_df.select(
-    "jobid", "phase_id"
-).distinct().groupBy("jobid").agg(
-    F.count("*").alias("total_io_phases")
-)
-
-final_df = final_df.join(job_phases_df, on="jobid", how="left")
-
-# Remplacer les nulls par 0 si un job n'a aucune phase I/O
-final_df = final_df.withColumn(
-    "total_io_phases",
-    F.coalesce(F.col("total_io_phases"), F.lit(0))
-)
-
-
+# Final Selection
 final_df = final_df.select(
     "jobid",
     "uid",
@@ -249,18 +243,44 @@ final_df = final_df.select(
 
 
 
-# Compare with existing results
 df_result = spark.read.option("header", "false").option("inferSchema", "true").csv("/user/fzanonboito/CISD/topjobs/topjobs_9/*")
-print("df_result has " + str(df_result.count()))
-df_result.sort("_c0").show()
+df_result = df_result.select(
+    F.col("_c0").alias("jobid"),
+    F.col("_c1").alias("uid"),
+    F.col("_c2").alias("execution_time"),
+    F.col("_c3").alias("total_data_amount"),
+    F.col("_c4").alias("job_io_time"),
+    F.col("_c5").alias("total_files"),
+    F.col("_c6").alias("total_io_phases")
+)
+
+cols = [
+    "execution_time",
+    "total_data_amount",
+    "job_io_time",
+    "total_files",
+    "total_io_phases"
+]
+
+for c in cols:
+    final_df = final_df.withColumn(c, F.col(c).cast("double"))
+    df_result = df_result.withColumn(c, F.col(c).cast("double"))
 
 
-print("final_df has " + str(final_df.count()))
-final_df.sort("jobid").show()
+diff_final_minus_result = final_df.subtract(df_result)
+
+print("Lignes présentes dans final_df mais absentes de df_result :",
+      diff_final_minus_result.count())
+
+diff_final_minus_result.sort("jobid").show(truncate=False)
 
 
+diff_result_minus_final = df_result.subtract(final_df)
 
-df_result = df_result.withColumnRenamed("_c0", "jobid_result")
+print("Lignes présentes dans df_result mais absentes de final_df :",
+      diff_result_minus_final.count())
+
+diff_result_minus_final.sort("jobid").show(truncate=False)
 
 # common_jobids = final_df.join(
 #     df_result,
@@ -280,7 +300,6 @@ df_result = df_result.withColumnRenamed("_c0", "jobid_result")
 
 # print("missing_in_jobids has " + str(missing_in_jobids.count()))
 # missing_in_jobids.show()
-
 
 if len(sys.argv) != 1:
     jobids_df.write.mode("overwrite").csv(output_path)
