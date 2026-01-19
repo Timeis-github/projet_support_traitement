@@ -202,20 +202,22 @@ final_df = final_df.withColumn(
 
 # Calcul du nombre de fichier (accessed via POSIX interface from the Lustre file system)
 
-
-# Nombre total de fichiers POSIX Lustre par job
-job_files_df = lustre_df.filter(
-    (F.col("POSIX_BYTES_READ") + F.col("POSIX_BYTES_WRITTEN")) > 0
-).groupBy("jobid").agg(
-    F.count("*").alias("total_files")
+job_files_df = lines_df.filter(
+    (F.col("fstype") == "lustre") &
+    ((F.col("POSIX_BYTES_READ") + F.col("POSIX_BYTES_WRITTEN")) > 0)
+).select(
+    "jobid",
+    "recordid"
+).distinct().groupBy("jobid").agg(
+    F.count("recordid").alias("total_files")
 )
 
+
+
+
+# S'assurer que les jobs sans fichiers Lustre ont 0
 final_df = final_df.join(job_files_df, on="jobid", how="left")
-
-final_df = final_df.withColumn(
-    "total_files",
-    F.coalesce(F.col("total_files"), F.lit(0))
-)
+final_df = final_df.withColumn("total_files", F.coalesce(F.col("total_files"), F.lit(0)))
 
 
 
@@ -261,24 +263,24 @@ final_df.sort("jobid").show()
 
 df_result = df_result.withColumnRenamed("_c0", "jobid_result")
 
-common_jobids = final_df.join(
-    df_result,
-    final_df.jobid == df_result.jobid_result,
-    "inner"
-).select(final_df.jobid).distinct()
+# common_jobids = final_df.join(
+#     df_result,
+#     final_df.jobid == df_result.jobid_result,
+#     "inner"
+# ).select(final_df.jobid).distinct()
 
-print("common_jobids has " + str(common_jobids.count()))
-common_jobids.show()
+# print("common_jobids has " + str(common_jobids.count()))
+# common_jobids.show()
 
 
-missing_in_jobids = df_result.join(
-    final_df,
-    df_result.jobid_result == final_df.jobid,
-    "left_anti"
-)
+# missing_in_jobids = df_result.join(
+#     final_df,
+#     df_result.jobid_result == final_df.jobid,
+#     "left_anti"
+# )
 
-print("missing_in_jobids has " + str(missing_in_jobids.count()))
-missing_in_jobids.show()
+# print("missing_in_jobids has " + str(missing_in_jobids.count()))
+# missing_in_jobids.show()
 
 if len(sys.argv) != 1:
     jobids_df.write.mode("overwrite").csv(output_path)
