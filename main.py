@@ -10,7 +10,6 @@ import os
 import sys
 
 
-
 #os.environ["SPARK_LOCAL_DIRS"] = "/home/llahlah/spark_tmp"
 #os.environ["TMPDIR"] = "/home/llahlah/spark_tmp"
 
@@ -25,7 +24,13 @@ spark = SparkSession(sc)
 start = timer()
 
 if len(sys.argv) == 1:
-    lines_df = spark.read.load("/user/fzanonboito/CISD/darshan/9/Darshan.csv", format = "csv", header = "true", inferSchema = "true")
+    
+    list_path = ["/user/fzanonboito/CISD/darshan/1/Darshan.csv","/user/fzanonboito/CISD/darshan/2/Darshan.csv","/user/fzanonboito/CISD/darshan/3/Darshan.csv"]
+    lines_df = spark.read.load("/user/fzanonboito/CISD/darshan/1/Darshan.csv", format = "csv", header = "true", inferSchema = "true")
+    dfs = [spark.read.option("header", True).option("inferSchema", True).csv(p) for p in list_path]
+    lines_df = dfs[0]
+    for df in dfs[1:]:
+        lines_df = lines_df.unionByName(df)
 elif len(sys.argv) < 3:
     print("Usage: spark-submit script.py <csv1> <csv2> ... <output_dir>")
     sys.exit(1)
@@ -91,13 +96,14 @@ job_data_df = job_data_df.cache() # Will be reused
 largest_jobs_IO_df = job_data_df.orderBy(F.desc("total_data_amount")).limit(top_n)
 
 # Users with largest I/O
-# Create a DataFrame with the top 10% users that access the most data
+# 1. Calculate which UIDs are the top 10% based on Lustre data
 user_data_df = file_data_df.groupBy("uid").agg(F.sum("data_amount").alias("total_data_amount"))
-user_data_df = user_data_df.cache()
-total_users = user_data_df.count()
-top_n = ceil(total_users * 0.1)
-largest_users_IO_df = user_data_df.orderBy(F.desc("total_data_amount")).limit(top_n)
-# get all jobs from these users
+total_users = lines_df.select("uid").distinct().count()
+top_n_users = ceil(total_users * 0.1)
+largest_users_IO_df = user_data_df.orderBy(F.desc("total_data_amount")).limit(top_n_users)
+
+# 2. Get EVERY jobid associated with those UIDs from the original dataset
+# This ensures jobs that didn't use Lustre are still included in the "jobs from top users" set
 largest_users_jobs_df = lines_df.join(largest_users_IO_df, on="uid", how="inner").select("jobid").distinct()
 largest_users_jobs_df = largest_users_jobs_df.cache()
 
@@ -243,7 +249,7 @@ final_df = final_df.select(
 
 
 
-df_result = spark.read.option("header", "false").option("inferSchema", "true").csv("/user/fzanonboito/CISD/topjobs/topjobs_9/*")
+df_result = spark.read.option("header", "false").option("inferSchema", "true").csv("/user/fzanonboito/CISD/topjobs/topjobs_1_to_3/*")
 df_result = df_result.select(
     F.col("_c0").alias("jobid"),
     F.col("_c1").alias("uid"),
@@ -282,24 +288,24 @@ print("Lignes présentes dans df_result mais absentes de final_df :",
 
 diff_result_minus_final.sort("jobid").show(truncate=False)
 
-# common_jobids = final_df.join(
-#     df_result,
-#     final_df.jobid == df_result.jobid_result,
-#     "inner"
-# ).select(final_df.jobid).distinct()
+common_jobids = final_df.join(
+    df_result,
+    final_df.jobid == df_result.jobid,
+    "inner"
+).select(final_df.jobid).distinct()
 
-# print("common_jobids has " + str(common_jobids.count()))
-# common_jobids.show()
+print("common_jobids has " + str(common_jobids.count()))
+common_jobids.show()
 
 
-# missing_in_jobids = df_result.join(
-#     final_df,
-#     df_result.jobid_result == final_df.jobid,
-#     "left_anti"
-# )
+missing_in_jobids = df_result.join(
+    final_df,
+    df_result.jobid == final_df.jobid,
+    "left_anti"
+)
 
-# print("missing_in_jobids has " + str(missing_in_jobids.count()))
-# missing_in_jobids.show()
+print("missing_in_jobids has " + str(missing_in_jobids.count()))
+missing_in_jobids.show()
 
 if len(sys.argv) != 1:
     jobids_df.write.mode("overwrite").csv(output_path)
